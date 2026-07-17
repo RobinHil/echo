@@ -1,0 +1,8 @@
+services:
+  echo:
+    build: .
+    container_name: echo-app
+    ports:
+      # Application disponible sur http://localhost:8080
+      - "8080:80"
+    restart: unless-stopped

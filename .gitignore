@@ -1,0 +1,26 @@
+# Dependances
+node_modules/
+
+# Build
+dist/
+dist-ssr/
+
+# Journaux
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Environnement
+.env
+.env.local
+.env.*.local
+
+# Editeurs et systeme
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+
+# Divers
+*.local
+coverage/
