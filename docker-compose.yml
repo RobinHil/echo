@@ -4,5 +4,5 @@ services:
     container_name: echo-app
     ports:
       # Application disponible sur http://localhost:8080
-      - "8080:80"
+      - "8080:8080"
     restart: unless-stopped
