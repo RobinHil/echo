@@ -9,9 +9,10 @@ import { Player } from './components/Player'
 import { ExportPanel } from './components/ExportPanel'
 import { HistoryPanel } from './components/HistoryPanel'
 import { useAudioPlayer } from './hooks/useAudioPlayer'
-import { sonifyText } from './lib/textSonification'
-import { loadImageFromFile, sonifyImage } from './lib/imageSonification'
+import { briefFromText } from './lib/textSonification'
+import { briefFromImage, loadImageFromFile } from './lib/imageSonification'
 import { renderSequence } from './lib/renderAudio'
+import { composeBrief, type Brief } from './lib/compose'
 import { audioBufferToWav } from './lib/wav'
 import { addEntry, clearHistory, loadHistory, removeEntry, type HistoryEntry } from './lib/history'
 import type { InputMode, Sequence } from './lib/sequence'
@@ -54,6 +55,16 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
 
   const player = useAudioPlayer(result?.buffer ?? null)
+  const { stop: stopPlayback } = player
+
+  // Le son est lie a l'ecran du lecteur : des qu'on le quitte - retour a
+  // l'accueil, nouvelle creation, echec de generation - la lecture s'arrete.
+  // Un effet plutot qu'un appel dans chaque bouton : toutes les sorties sont
+  // couvertes, y compris celles ajoutees plus tard. stopPlayback ne declenche
+  // rien quand la lecture est deja a l'arret.
+  useEffect(() => {
+    if (screen !== 'result') stopPlayback()
+  }, [screen, stopPlayback])
 
   useEffect(() => {
     setHistory(loadHistory())
@@ -89,14 +100,15 @@ export default function App() {
   const handleGenerate = useCallback(() => {
     const label = mode === 'text' ? text.trim().replace(/\s+/g, ' ') : ((imageFile as File)?.name ?? '')
     void runGeneration(label, async () => {
-      let sequence: Sequence
+      let brief: Brief
       if (mode === 'text') {
-        sequence = sonifyText(text)
+        brief = briefFromText(text)
       } else {
         const image = await loadImageFromFile(imageFile as File)
-        sequence = sonifyImage(image)
+        brief = briefFromImage(image)
       }
-      const entries = addEntry(mode, label, sequence)
+      const sequence = composeBrief(brief)
+      const entries = addEntry(mode, label, brief)
       setHistory(entries)
       return { id: entries[0]?.id ?? null, mode, label, sequence }
     })
@@ -108,7 +120,7 @@ export default function App() {
         id: entry.id,
         mode: entry.mode,
         label: entry.label,
-        sequence: entry.sequence,
+        sequence: composeBrief(entry.brief),
       }))
     },
     [runGeneration],
@@ -219,7 +231,7 @@ export default function App() {
               player={player}
               buffer={result.buffer}
               title={result.label}
-              subtitle={`${result.mode === 'text' ? 'Texte' : 'Image'} - ${result.sequence.scaleName} - ${result.sequence.events.length} événements`}
+              subtitle={result.mode === 'text' ? 'Texte' : 'Image'}
             />
             <ExportPanel wav={result.wav} baseName={baseName} onError={setError} />
 

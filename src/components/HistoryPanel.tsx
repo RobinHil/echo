@@ -98,7 +98,7 @@ export function HistoryPanel({ open, onClose, entries, activeId, disabled, onSel
                         <Icon size={12} aria-hidden />
                         {dateFormatter.format(new Date(entry.date))}
                         <span aria-hidden>-</span>
-                        {entry.sequence.scaleName}
+                        {entry.brief.scale.label}
                       </span>
                       <span className="mt-1 block truncate text-sm text-ivory">{entry.label}</span>
                     </button>

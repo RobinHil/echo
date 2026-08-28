@@ -1,34 +1,22 @@
-import { SCALES, type Sequence, type SoundEvent, chordNotes, clamp, repeatIfShort, scaleNote } from './sequence'
+import { clamp, lerp } from './sequence'
+import { pickScale } from './strudel'
+import type { Brief, MelodyStep } from './compose'
 
-// Sonification d'une image en arrangement complet. L'image est balayee de
-// gauche a droite : chaque colonne devient un pas de temps.
+// Analyse d'une image en intention musicale.
 //
-// Melodie (par colonne) :
-//   - teinte moyenne                   -> degre de l'echelle, donc hauteur
-//   - luminosite moyenne               -> velocite (une colonne sombre se tait)
-//   - saturation moyenne               -> duree de la note
-// Harmonie (par segment de 16 colonnes) :
-//   - teinte dominante du segment      -> accord du segment (nappe tenue)
-//   - basse : fondamentale et quinte de l'accord, toutes les 4 colonnes
-//   - arpege : double-croches continues sur les sons de l'accord, velocite
-//     portee par la saturation de la colonne
-// Rythme :
-//   - grosse caisse sur chaque temps (4 colonnes), renforcee quand l'image
-//     est contrastee ; charley par colonne, accentue par les ruptures de
-//     luminosite entre colonnes voisines
-// Couleur globale :
-//   - teinte dominante de l'image      -> echelle (chaud = majeur, froid = mineur)
-//   - contraste global (ecart-type)    -> ouverture du filtre
-//   - saturation globale               -> reverb et chorus ; dispersion -> delay
-// Le balayage est rejoue en un second passage plus doux (forme A / A').
-// Toutes les colonnes sont reduites en amont a une grille fixe : le resultat
-// est deterministe et la Sequence extraite suffit a regenerer le son.
+// L'image est reduite a une grille de 96 colonnes par 8 lignes, balayee de
+// gauche a droite. Chaque colonne fournit une teinte moyenne, une luminosite,
+// une saturation, une texture verticale et une energie de contour ; ces cinq
+// mesures alimentent le meme Brief que la sonification de texte, donc le meme
+// moteur de composition.
+//
+// L'extraction (canvas) est separee de l'analyse : sonifyGrid ne depend que
+// de nombres, ce qui la rend testable hors navigateur.
 
-const COLUMNS = 64
-const ROWS = 6
-const STEP = 0.24 // secondes par colonne, soit environ 15 s de balayage
+const COLUMNS = 96
+const ROWS = 8
 
-interface Cell {
+export interface Cell {
   h: number // teinte [0..360]
   s: number // saturation [0..1]
   l: number // luminosite [0..1]
@@ -72,196 +60,230 @@ export function extractGrid(image: HTMLImageElement): Cell[][] {
   return grid
 }
 
-export function sonifyImage(image: HTMLImageElement): Sequence {
-  const grid = extractGrid(image)
+// Moyenne circulaire des teintes, ponderee par la saturation : les gris ne
+// votent pas, et le passage 359 -> 0 degres ne fausse pas la moyenne.
+function meanHue(cells: Cell[]): { hue: number; concentration: number } {
+  let x = 0
+  let y = 0
+  let weight = 0
+  for (const c of cells) {
+    x += Math.cos((c.h * Math.PI) / 180) * c.s
+    y += Math.sin((c.h * Math.PI) / 180) * c.s
+    weight += c.s
+  }
+  const hue = ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360
+  return { hue, concentration: Math.sqrt(x * x + y * y) / Math.max(weight, 1e-6) }
+}
 
-  // Statistiques globales.
+function hashNumbers(values: number[], seed: number): number {
+  let h = seed >>> 0
+  for (const v of values) {
+    h = (Math.imul(h, 31) + Math.round(v * 1000)) >>> 0
+  }
+  return h
+}
+
+interface Column {
+  hue: number
+  sat: number
+  lum: number
+  // Ecart-type vertical de luminosite : mesure la texture de la colonne.
+  texture: number
+  // Ecart de luminosite avec la colonne precedente : mesure les contours.
+  edge: number
+}
+
+export function briefFromGrid(grid: Cell[][]): Brief {
   const flat = grid.flat()
   const avgL = flat.reduce((s, c) => s + c.l, 0) / flat.length
   const avgS = flat.reduce((s, c) => s + c.s, 0) / flat.length
   const contrast = Math.sqrt(flat.reduce((s, c) => s + (c.l - avgL) ** 2, 0) / flat.length)
-  // Teinte dominante ponderee par la saturation (les gris ne votent pas).
-  let hx = 0
-  let hy = 0
-  for (const c of flat) {
-    hx += Math.cos((c.h * Math.PI) / 180) * c.s
-    hy += Math.sin((c.h * Math.PI) / 180) * c.s
-  }
-  const domHue = ((Math.atan2(hy, hx) * 180) / Math.PI + 360) % 360
-  const hueSpread = 1 - Math.sqrt(hx * hx + hy * hy) / Math.max(flat.reduce((s, c) => s + c.s, 0), 1e-6)
+  const global = meanHue(flat)
+  // Dispersion des teintes : 0 pour une image monochrome, 1 pour une image
+  // qui parcourt tout le cercle chromatique.
+  const hueSpread = 1 - global.concentration
 
-  // Echelle selon la temperature de couleur dominante :
-  // rouges et jaunes = majeur, verts = dorien, bleus = mineur, violets = lydien.
-  let scaleName: string
-  if (domHue < 70 || domHue >= 330) scaleName = 'pentatonique majeure'
-  else if (domHue < 170) scaleName = 'dorien'
-  else if (domHue < 260) scaleName = 'pentatonique mineure'
-  else scaleName = 'lydien'
-  const scale = SCALES[scaleName]
+  const columns: Column[] = grid.map((col, i) => {
+    const lum = col.reduce((s, c) => s + c.l, 0) / ROWS
+    const sat = col.reduce((s, c) => s + c.s, 0) / ROWS
+    const texture = Math.sqrt(col.reduce((s, c) => s + (c.l - lum) ** 2, 0) / ROWS)
+    const previous = i > 0 ? grid[i - 1].reduce((s, c) => s + c.l, 0) / ROWS : lum
+    return { hue: meanHue(col).hue, sat, lum, texture, edge: Math.abs(lum - previous) }
+  })
 
+  const avgTexture = columns.reduce((s, c) => s + c.texture, 0) / columns.length
+  const avgEdge = columns.reduce((s, c) => s + c.edge, 0) / columns.length
+  // Tendance de luminosite gauche -> droite : une image qui s'eclaircit ne
+  // sonne pas comme une image qui s'assombrit.
+  const half = Math.floor(columns.length / 2)
+  const gradient =
+    columns.slice(half).reduce((s, c) => s + c.lum, 0) / half -
+    columns.slice(0, half).reduce((s, c) => s + c.lum, 0) / half
+
+  // --- Caracteres continus ---
+
+  // Energie : contours marques, texture verticale, contraste global.
+  const energy = clamp(
+    0.12 + clamp(avgEdge * 7, 0, 1) * 0.36 + clamp(avgTexture * 4, 0, 1) * 0.28 + clamp(contrast * 3, 0, 1) * 0.24,
+    0,
+    1,
+  )
+
+  // Couleur affective : teintes chaudes et image claire tirent vers le
+  // lumineux, teintes froides et image sombre vers le grave.
+  const warmth = Math.cos((global.hue * Math.PI) / 180)
+  const brightness = clamp(warmth * 0.55 + (avgL - 0.46) * 2.2 + (avgS - 0.4) * 0.5, -1, 1)
+
+  // Densite : richesse chromatique et saturation.
+  const density = clamp(hueSpread * 0.5 + avgS * 0.5, 0, 1)
+
+  // Tension : dispersion des teintes et irregularite des contours.
+  const edgeSpread = Math.sqrt(columns.reduce((s, c) => s + (c.edge - avgEdge) ** 2, 0) / columns.length)
+  const tension = clamp(hueSpread * 0.45 + clamp(edgeSpread * 9, 0, 1) * 0.35 + Math.abs(gradient) * 0.2, 0, 1)
+
+  // Espace : image douce, peu contrastee, peu saturee.
+  const space = clamp((1 - clamp(contrast * 3, 0, 1)) * 0.45 + (1 - avgS) * 0.3 + (1 - energy) * 0.25, 0, 1)
+
+  const hashes = [
+    hashNumbers(columns.map((c) => c.hue), 0x9e37),
+    hashNumbers(columns.map((c) => c.lum), 0x85eb),
+    hashNumbers(columns.map((c) => c.sat), 0xc2b2),
+    hashNumbers(columns.map((c) => c.edge), 0x27d4),
+    hashNumbers([global.hue, avgL, avgS, contrast, hueSpread], 0x165667),
+    hashNumbers(columns.map((c) => c.texture), 0xd3a2),
+  ]
+
+  const scale = pickScale(brightness, hashes[0])
   // Tonique tiree de la teinte dominante : deux images aux couleurs proches
   // partagent un centre tonal proche.
-  const root = Math.round((domHue / 360) * 12) % 12
+  const root = Math.round((global.hue / 360) * 12) % 12
 
-  const events: SoundEvent[] = []
-  const START = 0.1
+  // --- Ligne melodique : une colonne, un pas ---
+  // Les colonnes consecutives de teinte et de luminosite proches sont fondues
+  // en une note plus longue : les aplats tiennent, les zones detaillees
+  // s'agitent.
+  const melody: MelodyStep[] = []
 
-  // Statistiques par colonne, reutilisees par toutes les couches.
-  const columns = grid.map((col) => {
-    const cL = col.reduce((s, c) => s + c.l, 0) / ROWS
-    const cS = col.reduce((s, c) => s + c.s, 0) / ROWS
-    let cx = 0
-    let cy = 0
-    for (const c of col) {
-      cx += Math.cos((c.h * Math.PI) / 180) * (c.s + 0.02)
-      cy += Math.sin((c.h * Math.PI) / 180) * (c.s + 0.02)
-    }
-    return { l: cL, s: cS, h: ((Math.atan2(cy, cx) * 180) / Math.PI + 360) % 360 }
-  })
+  // La hauteur est lue sur trois axes - teinte, luminosite, texture - melanges
+  // au prorata de ce que chacun apporte reellement dans cette image. Un
+  // paysage colore fait chanter sa teinte, une photo en noir et blanc sa
+  // luminosite, une image dense sa texture. Ponderer par la seule saturation
+  // ne suffit pas : un ciel bleu est tres sature et pourtant de teinte
+  // constante, il tomberait sur une note unique.
+  const hueOffsets = columns.map((c) => ((c.hue - global.hue + 540) % 360) - 180)
+  const lums = columns.map((c) => c.lum)
+  const textures = columns.map((c) => c.texture)
 
-  // ---- Harmonie : un accord par segment de 16 colonnes ----
-  const SEGMENT = 16
-  const degreePool = [0, 3, 4, 5]
-  const segments: { degree: number; s: number; l: number }[] = []
-  for (let seg = 0; seg < COLUMNS / SEGMENT; seg++) {
-    const slice = columns.slice(seg * SEGMENT, (seg + 1) * SEGMENT)
-    let sx = 0
-    let sy = 0
-    for (const c of slice) {
-      sx += Math.cos((c.h * Math.PI) / 180) * (c.s + 0.02)
-      sy += Math.sin((c.h * Math.PI) / 180) * (c.s + 0.02)
-    }
-    const segHue = ((Math.atan2(sy, sx) * 180) / Math.PI + 360) % 360
-    const segS = slice.reduce((s, c) => s + c.s, 0) / slice.length
-    const segL = slice.reduce((s, c) => s + c.l, 0) / slice.length
-    // Le premier segment pose la tonique, les suivants suivent leur teinte.
-    const degree = seg === 0 ? 0 : degreePool[Math.round((segHue / 360) * (degreePool.length - 1))]
-    segments.push({ degree, s: segS, l: segL })
+  const spanOf = (values: number[]) => Math.max(...values) - Math.min(...values)
+  // Chaque axe est normalise sur sa propre etendue : une image aux nuances
+  // subtiles deploie autant d'ambitus qu'une image franchement contrastee.
+  const normalizer = (values: number[], minimumSpan: number) => {
+    const min = Math.min(...values)
+    const span = Math.max(spanOf(values), minimumSpan)
+    return (value: number) => clamp((value - min) / span, 0, 1)
   }
+  const normHue = normalizer(hueOffsets, 30)
+  const normLum = normalizer(lums, 0.12)
+  const normTexture = normalizer(textures, 0.08)
 
-  // ---- Melodie : une note par colonne ----
-  let previousDegree = -1
-  for (let x = 0; x < COLUMNS; x++) {
-    const time = START + x * STEP
-    const { l: cL, s: cS, h: cH } = columns[x]
+  // Poids d'un axe : ce qu'il varie, tempere par sa fiabilite. La teinte n'a
+  // de sens que sur une image sature ; la texture reste un appoint.
+  const weights = {
+    hue: clamp(spanOf(hueOffsets) / 90, 0, 1) * clamp(avgS * 2.5, 0, 1),
+    lum: clamp(spanOf(lums) / 0.3, 0, 1),
+    texture: clamp(spanOf(textures) / 0.25, 0, 1) * 0.6,
+  }
+  // Image totalement uniforme : la luminosite reprend la main par defaut.
+  const totalWeight = weights.hue + weights.lum + weights.texture || 1
+  if (weights.hue + weights.lum + weights.texture === 0) weights.lum = 1
 
-    // Une colonne presque noire est un silence dans le balayage.
-    if (cL < 0.05) {
-      previousDegree = -1
-      continue
+  // Seuil de silence relatif a l'image : une photo nocturne ne doit pas se
+  // taire entierement, seules ses zones les plus sombres se taisent.
+  const silenceBelow = Math.max(0.04, avgL * 0.35)
+
+  let index = 0
+  while (index < columns.length) {
+    const column = columns[index]
+    let run = 1
+    while (
+      index + run < columns.length &&
+      Math.abs(columns[index + run].lum - column.lum) < 0.06 &&
+      Math.abs(((columns[index + run].hue - column.hue + 540) % 360) - 180) < 25 &&
+      run < 6
+    ) {
+      run++
     }
 
-    // Teinte -> degre sur deux octaves ; saturation -> tenue de la note.
-    const degree = Math.round((cH / 360) * (scale.length * 2 - 1))
-    const duration = STEP * (0.9 + cS * 2.2)
-    const velocity = clamp(0.2 + cL * 0.75, 0.2, 0.95)
-
-    // Une colonne identique a la precedente prolonge le geste au lieu de
-    // marteler la meme note : les aplats deviennent des tenues.
-    if (degree === previousDegree && events.length > 0) {
-      const last = events[events.length - 1]
-      if (last.role === 'lead') {
-        last.duration += STEP
-        continue
-      }
-    }
-    previousDegree = degree
-
-    events.push({ time, duration, note: scaleNote(root, scale, degree, 4), velocity, role: 'lead' })
-  }
-
-  if (events.length === 0) {
-    throw new Error("L'image est entièrement noire : aucun son à générer.")
-  }
-
-  // ---- Nappes : l'accord du segment, tenu sur toute sa largeur ----
-  segments.forEach((seg, i) => {
-    if (seg.l < 0.04) return
-    const time = START + i * SEGMENT * STEP
-    for (const note of chordNotes(root, scale, seg.degree, 3)) {
-      events.push({
-        time,
-        duration: SEGMENT * STEP,
-        note,
-        velocity: clamp(0.25 + seg.s * 0.3, 0.25, 0.5),
-        role: 'pad',
+    if (column.lum < silenceBelow) {
+      melody.push({ degree: 0, weight: run, velocity: 0, octave: 0, rest: true })
+    } else {
+      const position =
+        (weights.hue * normHue(hueOffsets[index]) +
+          weights.lum * normLum(column.lum) +
+          weights.texture * normTexture(column.texture)) /
+        totalWeight
+      melody.push({
+        degree: Math.round(position * (scale.size * 2 - 1)),
+        weight: run,
+        velocity: clamp(0.3 + column.lum * 0.6 + column.sat * 0.12, 0.25, 0.95),
+        // La texture verticale pousse la note vers l'aigu.
+        octave: column.texture > avgTexture * 1.6 ? 1 : column.lum < avgL * 0.6 ? -1 : 0,
+        rest: false,
       })
     }
-  })
-
-  // ---- Basse : fondamentale et quinte de l'accord, toutes les 4 colonnes ----
-  for (let x = 0; x < COLUMNS; x += 4) {
-    const seg = segments[Math.floor(x / SEGMENT)]
-    if (seg.l < 0.04) continue
-    events.push({
-      time: START + x * STEP,
-      duration: 3.4 * STEP,
-      note: scaleNote(root, scale, seg.degree + (x % 8 === 0 ? 0 : 4), 2),
-      velocity: clamp(0.45 + seg.l * 0.2, 0.45, 0.65),
-      role: 'bass',
-    })
+    index += run
   }
 
-  // ---- Arpege : double-croches sur l'accord, portees par la saturation ----
-  const arpPattern = [0, 2, 4, 2]
-  for (let x = 0; x < COLUMNS; x++) {
-    const col = columns[x]
-    if (col.l < 0.05) continue
-    const seg = segments[Math.floor(x / SEGMENT)]
-    events.push({
-      time: START + x * STEP,
-      duration: 0.8 * STEP,
-      note: scaleNote(root, scale, seg.degree + arpPattern[x % arpPattern.length], 5),
-      velocity: clamp(0.16 + col.s * 0.3, 0.16, 0.42),
-      role: 'arp',
-    })
-  }
-
-  // ---- Percussions : pulsation reguliere, accents sur les ruptures ----
-  for (let x = 0; x < COLUMNS; x++) {
-    const time = START + x * STEP
-    if (x % 4 === 0) {
-      events.push({ time, duration: 0.2, note: 'C1', velocity: x % 8 === 0 ? 0.85 : 0.65, role: 'kick' })
+  // --- Progression : un accord par bande verticale de l'image ---
+  const bands = 6
+  const bandSize = Math.ceil(columns.length / bands)
+  const pool = [0, 5, 3, 4, 2, 6]
+  const progression: number[] = []
+  for (let b = 0; b < bands; b++) {
+    const slice = columns.slice(b * bandSize, (b + 1) * bandSize)
+    if (slice.length === 0) continue
+    if (b === 0) {
+      progression.push(0)
+      continue
     }
-    // Rupture de luminosite entre colonnes voisines -> charley accentue.
-    const jump = x > 0 ? Math.abs(columns[x].l - columns[x - 1].l) : 0
-    if (columns[x].l < 0.03 && jump < 0.05) continue
-    events.push({
-      time,
-      duration: 0.05,
-      note: 'C6',
-      velocity: clamp(0.14 + jump * 2 + (x % 2 === 0 ? 0.08 : 0), 0.14, 0.5),
-      role: 'hat',
-    })
-    if (jump > 0.25) {
-      events.push({ time, duration: 0.18, note: 'C1', velocity: 0.55, role: 'kick' })
-    }
+    // La bande vote avec ses trois mesures : deux bandes de meme teinte mais
+    // de clarte differente ne posent pas le meme accord.
+    const bandHue = slice.reduce((s, c) => s + c.hue, 0) / slice.length
+    const bandLum = slice.reduce((s, c) => s + c.lum, 0) / slice.length
+    const bandSat = slice.reduce((s, c) => s + c.sat, 0) / slice.length
+    progression.push(pool[hashNumbers([bandHue, bandLum, bandSat], 0x51ed) % pool.length])
   }
-
-  // ---- Forme A / A' : le balayage est rejoue une seconde fois, plus doux ----
-  const { events: finalEvents, end } = repeatIfShort(events, COLUMNS * STEP + 1)
 
   return {
-    events: finalEvents,
-    duration: end + 2.5,
-    effects: {
-      // Image saturee = espace et mouvement ; image terne = son sec.
-      reverbWet: clamp(0.15 + avgS * 0.4, 0.15, 0.5),
-      delayWet: clamp(hueSpread * 0.35, 0.05, 0.35),
-      delayFeedback: clamp(0.2 + hueSpread * 0.3, 0.2, 0.5),
-      chorusDepth: clamp(avgS * 0.8, 0, 0.7),
-      // Image contrastee = spectre ouvert, image plate = son feutre.
-      filterCutoff: clamp(1400 + contrast * 16000, 1400, 7600),
-    },
-    scaleName,
+    scale,
+    root,
+    energy,
+    density,
+    tension,
+    space,
+    melody,
+    progression,
+    hashes,
+    // Signature chromatique globale (teinte dominante, clarte, saturation,
+    // contraste) : deux images d'aspect voisin s'instrumentent pareil.
+    signature: hashes[4] % 512,
+    // Une image riche en contours et en couleurs merite une piece plus longue.
+    targetSeconds: clamp(lerp(18, 58, density * 0.5 + clamp(avgEdge * 6, 0, 1) * 0.5), 18, 58),
   }
+}
+
+export function briefFromImage(image: HTMLImageElement): Brief {
+  return briefFromGrid(extractGrid(image))
 }
 
 export function loadImageFromFile(file: File): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file)
     const img = new Image()
-    img.onload = () => resolve(img)
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve(img)
+    }
     img.onerror = () => {
       URL.revokeObjectURL(url)
       reject(new Error('Le fichier ne peut pas être lu comme une image.'))

@@ -1,9 +1,11 @@
-import type { InputMode, Sequence } from './sequence'
+import type { Brief } from './compose'
+import type { InputMode } from './sequence'
 
 // Historique local des creations, persiste en localStorage.
-// On stocke la Sequence complete (description deterministe de la piece),
-// pas l'audio encode : quelques dizaines de Ko par entree suffisent pour
-// regenerer un rendu strictement identique a la demande.
+// On stocke le Brief, c'est-a-dire l'intention musicale extraite du contenu
+// (couleur, energie, ligne melodique, progression), pas les evenements ni
+// l'audio : quelques kilo-octets par entree suffisent a regenerer un rendu
+// strictement identique, sans conserver le texte ou l'image d'origine.
 
 export interface HistoryEntry {
   id: string
@@ -12,10 +14,10 @@ export interface HistoryEntry {
   label: string
   // Date ISO de creation.
   date: string
-  sequence: Sequence
+  brief: Brief
 }
 
-const STORAGE_KEY = 'echo.history.v1'
+const STORAGE_KEY = 'echo.history.v2'
 const MAX_ENTRIES = 20
 
 export function loadHistory(): HistoryEntry[] {
@@ -43,13 +45,13 @@ function persist(entries: HistoryEntry[]): HistoryEntry[] {
   }
 }
 
-export function addEntry(mode: InputMode, label: string, sequence: Sequence): HistoryEntry[] {
+export function addEntry(mode: InputMode, label: string, brief: Brief): HistoryEntry[] {
   const entry: HistoryEntry = {
     id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
     mode,
     label: label.length > 80 ? `${label.slice(0, 77)}...` : label,
     date: new Date().toISOString(),
-    sequence,
+    brief,
   }
   return persist([entry, ...loadHistory()])
 }

@@ -10,6 +10,7 @@ export interface AudioPlayer {
   duration: number
   volume: number
   toggle: () => void
+  stop: () => void
   seek: (seconds: number) => void
   setVolume: (v: number) => void
 }
@@ -21,7 +22,6 @@ export function useAudioPlayer(buffer: AudioBuffer | null): AudioPlayer {
   const startedAtRef = useRef(0)
   const offsetRef = useRef(0)
   const rafRef = useRef(0)
-  const endedCleanlyRef = useRef(false)
 
   const [isPlaying, setIsPlaying] = useState(false)
   const [position, setPosition] = useState(0)
@@ -38,7 +38,6 @@ export function useAudioPlayer(buffer: AudioBuffer | null): AudioPlayer {
 
   const stopSource = useCallback(() => {
     if (sourceRef.current) {
-      endedCleanlyRef.current = true
       try {
         sourceRef.current.stop()
       } catch {
@@ -72,9 +71,13 @@ export function useAudioPlayer(buffer: AudioBuffer | null): AudioPlayer {
       const source = ctx.createBufferSource()
       source.buffer = buffer
       source.connect(gainRef.current as GainNode)
-      endedCleanlyRef.current = false
       source.onended = () => {
-        if (endedCleanlyRef.current) return
+        // onended est asynchrone : celui d'une source remplacee (recherche
+        // dans la piste, relecture) arrive apres la mise en place de la
+        // suivante. Seule la source courante a le droit de declarer la fin,
+        // sinon un clic sur la frise remettrait la lecture a zero pendant que
+        // la nouvelle source joue.
+        if (sourceRef.current !== source) return
         offsetRef.current = 0
         setIsPlaying(false)
         setPosition(buffer.duration)
@@ -99,6 +102,18 @@ export function useAudioPlayer(buffer: AudioBuffer | null): AudioPlayer {
     if (isPlaying) pause()
     else play()
   }, [isPlaying, pause, play])
+
+  // Arret complet, position remise a zero. Sert quand le lecteur quitte
+  // l'ecran : le son doit s'arreter avec lui.
+  const stop = useCallback(() => {
+    // Rien a faire si la lecture est deja a l'arret au debut : on evite un
+    // rendu inutile a chaque changement d'ecran.
+    if (!sourceRef.current && offsetRef.current === 0) return
+    stopSource()
+    offsetRef.current = 0
+    setIsPlaying(false)
+    setPosition(0)
+  }, [stopSource])
 
   const seek = useCallback(
     (seconds: number) => {
@@ -138,5 +153,5 @@ export function useAudioPlayer(buffer: AudioBuffer | null): AudioPlayer {
     }
   }, [stopSource])
 
-  return { isPlaying, position, duration: buffer?.duration ?? 0, volume, toggle, seek, setVolume }
+  return { isPlaying, position, duration: buffer?.duration ?? 0, volume, toggle, stop, seek, setVolume }
 }
