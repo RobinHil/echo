@@ -268,6 +268,25 @@ export default function App() {
           Aucune donnée ne quitte votre navigateur. Sonification algorithmique, sans intelligence artificielle
           générative.
         </p>
+        {/*
+          Echo depend de Strudel, sous AGPL-3.0-or-later, et est donc publie sous
+          la meme licence. L'article 13 de l'AGPL impose d'offrir les sources aux
+          personnes qui utilisent le logiciel a distance : ce lien est cette offre,
+          et non une politesse. Le conteneur porte pointer-events-none, d'ou le
+          pointer-events-auto ici, sans quoi le lien serait inerte.
+        */}
+        <p className="mt-1.5 text-center text-[11px] leading-relaxed text-ivory-faint">
+          © {new Date().getFullYear()} Robin Hilaire. Logiciel libre sous AGPL-3.0-or-later,{' '}
+          <a
+            href="https://github.com/RobinHil/echo"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="pointer-events-auto underline decoration-dotted underline-offset-2 transition-colors hover:text-ivory-soft focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-gold"
+          >
+            code source
+          </a>
+          .
+        </p>
       </footer>
 
       <HistoryPanel
