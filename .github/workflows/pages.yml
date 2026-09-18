@@ -1,0 +1,162 @@
+name: Pages
+
+# Echo est une application entierement cliente : la synthese, le rendu audio et
+# l'encodage ffmpeg.wasm tournent dans le navigateur, sans aucun appel serveur.
+# Elle se publie donc telle quelle sur GitHub Pages.
+#
+# Pages doit etre regle sur "GitHub Actions" dans Settings > Pages. L'etape
+# configure-pages lit cette configuration au lieu de deviner une adresse, ce
+# qui fait qu'un domaine personnalise fonctionne sans toucher a ce fichier.
+#
+# Une reserve a connaitre : Pages ne pose pas d'en-tetes personnalises, donc le
+# public/_headers du depot est ignore ici. L'application n'en depend pas - le
+# core ffmpeg livre est mono-thread, sans SharedArrayBuffer, donc sans besoin
+# d'isolation cross-origin - mais la CSP et les en-tetes de securite qu'il
+# decrit n'existeront pas sur cette adresse.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Construit le site et prouve qu'il vaut d'etre publie. Une pull request
+  # s'arrete ici : rien n'est publie depuis une branche.
+  build:
+    name: Build and check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm avant setup-node, qui a besoin de le trouver dans le PATH pour
+      # mettre en cache son store. La version vient de `packageManager` dans
+      # package.json, les deux ne peuvent donc pas diverger.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      # Ou le site va vivre, demande a Pages plutot qu'ecrit en dur : la reponse
+      # est juste pour un site de projet, un site utilisateur et un domaine
+      # personnalise. base_path vaut "/echo" ou "" (site utilisateur), jamais
+      # "/", d'ou la normalisation vers une valeur terminee par un slash que
+      # Vite attend.
+      - uses: actions/configure-pages@v6
+        id: pages
+
+      - name: Build the static site
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          set -euo pipefail
+          base="${BASE_PATH%/}/"
+          echo "base: $base"
+          pnpm exec tsc -b
+          pnpm exec vite build --base="$base"
+
+      # Ce que le build est cense avoir produit, verifie plutot que suppose.
+      # Le binaire ffmpeg est le point fragile : il est charge a l'execution
+      # depuis import.meta.env.BASE_URL, donc une copie manquante ne casse que
+      # l'export audio, silencieusement, et longtemps apres le deploiement.
+      - name: Assert the build is complete
+        env:
+          BASE_PATH: ${{ steps.pages.outputs.base_path }}
+        run: |
+          set -euo pipefail
+          cd dist
+          base="${BASE_PATH%/}/"
+
+          for file in index.html favicon.svg ffmpeg/ffmpeg-core.js ffmpeg/ffmpeg-core.wasm; do
+            test -f "$file" || { echo "missing: $file"; exit 1; }
+          done
+
+          # Le bundle et la feuille de style sont references sous le chemin de
+          # base reel, et chaque fichier nomme existe bien.
+          grep -q "<title>Echo</title>" index.html
+          for asset in $(grep -oE "(src|href)=\"[^\"]*assets/[^\"]*\"" index.html | cut -d'"' -f2); do
+            relative=".${asset#"${base%/}"}"
+            test -f "$relative" || { echo "dangling asset: $asset"; exit 1; }
+          done
+
+          echo "dist is complete:"
+          du -sh .
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist
+
+  # Publie ce que le build a verifie. Pages exige ces permissions et cet
+  # environnement ; le groupe de concurrence est celui que partagent les
+  # deploiements Pages, et il n'annule pas un deploiement en cours.
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  # Repose les memes questions au site publie, par le reseau : un deploiement
+  # qui se declare reussi puis sert autre chose, ca arrive. C'est aussi la
+  # seule etape qui exerce le vrai chemin de base.
+  verify:
+    name: Verify what is published
+    if: github.event_name != 'pull_request'
+    needs: deploy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch the published page
+        env:
+          SITE: ${{ needs.deploy.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          site="${SITE%/}"
+          echo "site: $site"
+
+          # Pages sert la nouvelle version en quelques secondes d'ordinaire,
+          # mais pas toujours instantanement.
+          for attempt in 1 2 3 4 5; do
+            if curl -fsS "$site/" -o /tmp/index.html; then break; fi
+            echo "attempt $attempt failed, waiting"
+            sleep 10
+          done
+
+          grep -q "<title>Echo</title>" /tmp/index.html
+
+          # Le wasm doit etre servi, et servi comme du wasm : un Content-Type
+          # errone empeche WebAssembly.instantiateStreaming de demarrer.
+          type=$(curl -fsSI "$site/ffmpeg/ffmpeg-core.wasm" | tr -d '\r' \
+                 | awk -F': ' 'tolower($1)=="content-type" {print $2}')
+          echo "ffmpeg-core.wasm content-type: $type"
+          test "$type" = "application/wasm"
+
+          echo "verified $site"
