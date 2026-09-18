@@ -1,5 +1,7 @@
 # Echo
 
+En ligne : <https://robinhil.github.io/echo/>
+
 Echo transforme un texte ou une image en une pièce sonore générée algorithmiquement, entièrement dans le navigateur. Aucune IA générative, aucun serveur, aucune donnée transmise : la sonification est un mapping déterministe entre les caractéristiques de l'entrée et une intention musicale.
 
 ## Principe
